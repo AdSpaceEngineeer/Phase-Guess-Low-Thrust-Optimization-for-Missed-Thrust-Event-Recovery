@@ -1,0 +1,17 @@
+# This code creates for a flyby mission facing an unforeseen missed thrust event 
+# a low fidelity optimized solution space of 
+# ballistic time (engines cut off), recovery time (engines back on) 
+# and fuel consumption (over recovery trajectory)
+# which can be used by a mission designer to choose a small subset of time of flight
+# within which a fixed-time high fidelity optimization can be run.
+
+
+#import packages
+import math as m
+import numpy as np
+from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
+from datetime import date
+import pandas as pd
+from scipy.interpolate import griddata
+import time
