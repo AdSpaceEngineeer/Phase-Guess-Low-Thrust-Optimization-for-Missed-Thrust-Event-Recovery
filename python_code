@@ -15,3 +15,473 @@ from datetime import date
 import pandas as pd
 from scipy.interpolate import griddata
 import time
+
+# Hyperparameters
+
+AU = 1.5e8                        # km
+Sun_grav_param = 1.327e11         # km^3 / s^2
+TU = m.sqrt(AU**3/Sun_grav_param) # seconds
+#print(TU)
+muS = 1                           # in canonical units
+muM = 4.28e4                      # km^3 / s^2
+days_step = 1                     # in days
+
+#State of Mars in Helio-Aero-Ecliptic coordinate system on Nov 15, 2025, in AU and TU
+#X_m_0 = np.array([1.52, 0, 0, m.sqrt(1/1.52)]) 
+
+#Planned state of spacecraft to flyby around Mars on May 15, 2026, in AU and TU
+X_f_0 = np.array([-0.7, 1.35, -1*m.sqrt(1/1.52)*m.cos(27.4*m.pi/180), -1*m.sqrt(1/1.52)*m.sin(27.4*m.pi/180)]) 
+
+# Helio-areocentric states of Psyche between Nov 15, 2025 and Mar 15, 2026 in AU and TU
+# Assuming after missed thrust Psyche orbit is circular around Sun
+# angles in radians
+#Nov15 = np.array([1.99, 1.05, -1*m.sqrt(1/2.37)*m.cos(62.35*m.pi/180), m.sqrt(1/2.37)*m.sin(62.35*m.pi/180)])
+#Nov15 = np.array([1.99, 1.05, -1*m.sqrt(1/2.37)*m.cos(52.45*m.pi/180), m.sqrt(1/2.37)*m.sin(52.45*m.pi/180)])
+Nov15 = np.array([1.99, 1.05, -1*m.sqrt(1/2.37)*m.cos(45*m.pi/180), m.sqrt(1/2.37)*m.sin(45*m.pi/180)])
+Dec15 = np.array([1.71, 1.05, -1*m.sqrt(1/2)*m.cos(58.51*m.pi/180), m.sqrt(1/2)*m.sin(58.51*m.pi/180)])
+Jan15 = np.array([1.33, 1.43, -1*m.sqrt(1/1.95)*m.cos(43*m.pi/180), m.sqrt(1/1.95)*m.sin(43*m.pi/180)])
+Feb15 = np.array([0.95, 1.43, -1*m.sqrt(1/1.71)*m.cos(33.7*m.pi/180), m.sqrt(1/1.71)*m.sin(33.7*m.pi/180)])
+Mar15 = np.array([0.57, 1.52, -1*m.sqrt(1/1.62)*m.cos(20.56*m.pi/180), m.sqrt(1/1.62)*m.sin(20.56*m.pi/180)])
+Missed_Thrust_States = np.array([Nov15, Dec15, Jan15, Feb15, Mar15])
+
+# boundary conditions, linearization conditions
+delta_r_update = 0.0046   # change in dist from Sun before updating umax, in AU
+SOI = 0.038              # Mars SOI x 10 as limit of stage 1, in AU
+radius_M = 3389.5         # km, radius of Mars
+
+# Psyche consumes just 0.35 kilograms to 1.3 kilograms of xenon a day, 
+# depending on the thruster power level, 
+# as per https://www.jpl.nasa.gov/press-kits/psyche/quick-facts
+
+total_mass = 2747 # in kgs, including fuel
+total_fuel_atlaunch = 1085 # in kgs
+fuel_consumption_rate = 1.0 # in kgs per day
+# fuel used as of date of missed thrust (5 dates) since launch on Oct 13, 2023, in kgs
+fuel_Nov15 = fuel_consumption_rate * (date(2025, 11, 15) - date(2023, 10, 13)).days
+fuel_Dec15 = fuel_consumption_rate * (date(2025, 12, 15) - date(2023, 10, 13)).days
+fuel_Jan15 = fuel_consumption_rate * (date(2026, 1, 15) - date(2023, 10, 13)).days
+fuel_Feb15 = fuel_consumption_rate * (date(2026, 2, 15) - date(2023, 10, 13)).days
+fuel_Mar15 = fuel_consumption_rate * (date(2026, 3, 15) - date(2023, 10, 13)).days
+fuel_used_array = np.array([fuel_Nov15, fuel_Dec15, fuel_Jan15, fuel_Feb15, fuel_Mar15])
+
+# spacecraft mass = total_mass minus fuel_used_array[] minus fuel_consumption_rate * time_lapse
+
+# CUSTOM FUNCTIONS
+
+# Custom function - Integrator function for 2BP orbit propagation
+
+def func_integrator_2BP(t, state, g):
+    rx = state[0]
+    ry = state[1]
+    vx = state[2]
+    vy = state[3]
+
+    deriv_state = np.zeros(4)
+
+    deriv_state[0] = vx
+    deriv_state[1] = vy
+    deriv_state[2] = g*rx
+    deriv_state[3] = g*ry
+
+    return deriv_state
+
+
+# Custom Function - to get next state after defined days of 2BP propagation
+
+def func_2BP_prop (X0, days):
+
+    g = func_get_g(func_get_r(X0),muS)
+    
+    days = days # in days
+    tol = 1e-7 
+    stamps = int(days) # integer no. of days
+    t = np.linspace(0, days*24*3600/TU, stamps) # in TU
+
+    int_sol = solve_ivp(func_integrator_2BP, t_span = (0, days*24*3600/TU), method = 'RK45', y0 = X0, t_eval = t, rtol=tol, args = (g,))
+
+    return np.swapaxes(int_sol.y, 0, 1)[-1]
+
+
+# Custom Function - get distance from primary body (Sun for stages 1 & 2, Mars for stage 3)
+
+def func_get_r(X):
+    return m.sqrt(X[0]**2 + X[1]**2)
+
+
+# Custom Function - get specific gravity at distance r
+
+def func_get_g(r_mag, mu):
+    return -1*mu/r_mag**3
+
+
+#Custom Function - get maximum value of magnitude of acceleration from thrust
+# at specific distance from Sun and specific dynamic mass
+
+def func_get_umax(r_mag, fuel_used, time_in_days, engines):
+    #Sun irradiation levels are r_mag distance
+    irrad = 63e6 * (0.00464/r_mag)**2   # in Watts per sqm
+    
+    #power, assuming 20% efficiency of solar panels, 75 sqm surface area
+    power = 0.20 * irrad * 75 * engines  # in Watts or kg sqm per sec^3
+
+    #thrust based on power, assuming ejection velocity 83km/s
+    thrust = power / 83000              # in kg m per sec^2 or Newtons
+    
+    #spacecraft mass = total_mass minus fuel_used_array[] minus fuel_consumption_rate * time_lapse
+    mass = total_mass - fuel_used - fuel_consumption_rate * time_in_days
+    
+    #umax = thrust/mass in m/s2, converted to km/s^2, then convereted to AU/TU^2
+    umax = ( thrust / mass ) * (1/1000) * (TU**2/AU)
+    return umax
+
+
+# Custom Function - compute Qx, Qy and return values of k (3 or 4) and u_sign (+1 or -1)
+
+def func_QxQY(Xm, Xsc, g):
+    Qx = (Xm[2]**2 - Xsc[2]**2)/(2*(Xm[0] - Xsc[0])) - g*Xsc[0]
+    Qy = (Xm[3]**2 - Xsc[3]**2)/(2*(Xm[1] - Xsc[1])) - g*Xsc[1]
+    
+    if Qx**2 > Qy**2 :
+        k = 3
+        if Qx > 0: u_sign = 1
+        else: u_sign = -1
+    
+    if Qx**2 < Qy**2 :
+        k = 4
+        if Qy > 0: u_sign = 1
+        else: u_sign = -1
+    
+    QxQy = np.array([k, u_sign])
+    return QxQy
+
+
+# Custom Function - guess phase of Lag based on u_sign
+
+def func_phase_guess(QxQy):
+    u_sign = QxQy[1]
+    if u_sign > 0 : phase = m.pi/2 
+    else: phase = -1*m.pi/2
+    return phase
+
+
+#Custom Function - Integrator function for controlled 2D state propagation
+def func_integrator_prop_2D(t, state2D, g, u):
+    r = state2D[0]
+    v = state2D[1]
+
+    deriv_state = np.zeros(2)
+
+    deriv_state[0] = v
+    deriv_state[1] = g*r + u
+
+    return deriv_state
+
+
+# Custom Function -  propagate either [rx,vx] or [ry,vy] to find final_time 
+# based on phase guess for the specific r_mag linearized instance
+# time not input as argument in this function because it is integrated at fixed day_step
+# 'g' and 'u' need to be defined before running this function, based on r_mag and lags 3 & 4
+
+def func_control_prop_2D(state2D, g, u): 
+        
+    #time step and tolerance
+    step = days_step*24*3600/TU # one day in TU
+    tol = 1e-7
+    stamps = 2 # propagate for just 1 step from TU = 0 to TU = sqrt(-g)
+    t = np.linspace(0, step, stamps) # in TU
+
+    # run RK23 integrator using scipy solve_ivp function template: 
+    int_sol = solve_ivp(func_integrator_prop_2D, t_span = (0, step), method = 'RK45', y0 = state2D, t_eval = t, rtol=tol, args = (g,u))
+
+    return np.swapaxes(int_sol.y, 0, 1)[-1]
+
+
+#Custom Function - get Stage 1 phase_j for Lag 4 given guess of phase_i for Lag 3 
+# and final time estimate
+
+def func_phase_j_s1(phase_i, Xf, tf, g):
+    x1 = Xf[0]
+    x2 = Xf[1]
+    x3 = Xf[2]
+    x4 = Xf[3]
+    
+    p = m.sqrt(-g)
+    
+    rhs = 1 - ( -1*x3*p*m.sin(p*tf + phase_i) - g*x1*m.cos(p*tf + phase_i) )
+    
+    phase_j = 0
+    increment = m.pi/36
+    list_phase_j = []
+    list_bisect_j = []
+    
+    for i in range(20):
+        list_phase_j.append(phase_j)
+        list_bisect_j.append(-1*x4*p*m.sin(p*tf+phase_j)-g*x2*m.cos(p*tf+phase_j)-rhs)
+        phase_j = phase_j + increment
+    
+    index = list_bisect_j.index(min(list_bisect_j))
+    phase_j = list_phase_j[index]
+    return phase_j # in radians
+
+
+
+#Custom Function - get Stage 1 phase_i for Lag 3 given guess of phase_j for Lag 4 and final time estimate
+
+def func_phase_i_s1(phase_j, Xf, tf, g):
+    x1 = Xf[0]
+    x2 = Xf[1]
+    x3 = Xf[2]
+    x4 = Xf[3]
+    
+    p = m.sqrt(-g)
+    
+    rhs = 1 - ( -1*x4*p*m.sin(p*tf + phase_j) - g*x2*m.cos(p*tf + phase_j) )
+    
+    phase_i = 0
+    increment = m.pi/36
+    list_phase_i = []
+    list_bisect_i = []
+    
+    for i in range(20):
+        list_phase_i.append(phase_i)
+        list_bisect_i.append(-1*x3*p*m.sin(p*tf+phase_i)-g*x1*m.cos(p*tf+phase_i)-rhs)
+        phase_i = phase_i + increment
+    
+    index = list_bisect_i.index(min(list_bisect_i))
+    phase_i = list_phase_i[index]
+    return phase_i
+
+#Custom Function - Integrator function for controlled 4D state propagation
+
+def func_integrator_prop_4D(t, state, g, ux, uy):
+    rx = state[0]
+    ry = state[1]
+    vx = state[2]
+    vy = state[3]
+
+    deriv_state = np.zeros(4)
+
+    deriv_state[0] = vx
+    deriv_state[1] = vy
+    deriv_state[2] = g*rx + ux
+    deriv_state[3] = g*ry + uy
+
+    return deriv_state
+
+
+# Custom Function - Controlled Propagation for position and velocity vectors
+
+def func_control_prop_4D(state, g, umax, phase_i, phase_j, tau):
+  
+    # tau is in TU, not days
+    # tau is the time lapsed for a single linearized iteration of r_mag until delta_r_update
+    
+    lag3 = m.cos(m.sqrt(-g)*tau + phase_i)
+    lag4 = m.cos(m.sqrt(-g)*tau + phase_j)
+    
+    if lag3 < 0: ux = umax
+    elif lag3 == 0: ux = 0
+    else: ux = -1*umax
+    
+    if lag4 < 0: uy = umax
+    elif lag4 == 0: uy = 0
+    else: uy = -1*umax
+
+    #time step and tolerance
+    step = days_step*24*3600/TU # one day in TU
+    tol = 1e-7
+    stamps = 2
+    t = np.linspace(0, step, stamps)
+
+    # run RK23 integrator using scipy solve_ivp function template: 
+    int_sol = solve_ivp(func_integrator_prop_4D, t_span = (0, step), method = 'RK45', y0 = state, t_eval = t, rtol=tol, args = (g, ux, uy))
+
+    return np.swapaxes(int_sol.y, 0, 1)[-1]
+
+
+# Custom Function - compute distance lapsed before g and umax need to be updated
+
+def func_get_delta_r(Xsc_next, Xsc_0):
+    S_next = m.sqrt(Xsc_next[0]**2 + Xsc_next[1]**2)
+    S_0 = m.sqrt(Xsc_0[0]**2 + Xsc_0[1]**2)
+    delta_r = m.sqrt((S_next - S_0)**2)
+    return delta_r # in AU
+
+
+# Custom Function - compute dynamic distance between SC and Mars to stop propagation when it enters Mars SOI
+    
+def func_SOI_dist(Xm, Xsc):
+    Sx = Xsc[0] - Xm[0]
+    Sy = Xsc[1] - Xm[1]
+    SOI_dist = m.sqrt(Sx**2 + Sy**2)
+    return SOI_dist # in AU
+
+
+
+# Function to create dataset of Days_Ballistic x Distance from Final State x Fuel Used
+
+def func_LowFidSolSpace(Xmt, fuel_used_0, days_ballistic, engines, mt_date, max_date):
+    
+    #Xsc state at recovery after engines back on
+    Xr = func_2BP_prop(Xmt, days_ballistic)
+    max_time_left = ((max_date - mt_date).days - days_ballistic)*24*3600/TU #in TU
+    
+    #setting up the r_mag linearization loop
+    SOI_dist = 10 # in AU
+    time_lapse_s1 = 0 # in TU
+    Xsc = Xr # engines back on
+    thrust_count = 0 # count number of times ux, uy are on
+    fuel_used = fuel_used_0
+    
+    while SOI_dist > SOI:
+
+        r_mag = func_get_r(Xsc) # in AU
+        g = func_get_g(r_mag, muS) # in AU/TU^2
+        time_in_days = time_lapse_s1 * TU/(24*3600)
+        umax = func_get_umax(r_mag, fuel_used, time_in_days, engines)
+        QxQy = func_QxQY(X_f_0, Xsc, g) # returns np.array([k, u_sign])
+
+        # dynamic determination of lag3 and lag3 phases Xsc instance
+        k = int(QxQy[0])
+
+        # if QxQy analysis prioritizes ux over uy
+        if k == 3:
+            phase_i = func_phase_guess(QxQy)
+            tim_fin = 0 # in TU
+            x1 = Xsc[0]
+            x3 = Xsc[2]
+            while m.sqrt((x1 - X_f_0[0])**2) > SOI/1.41 :
+                if tim_fin > max_time_left - time_lapse_s1: break
+                lag3 = m.cos(m.sqrt(-g)*tim_fin + phase_i)
+                if lag3 > 0: u = -1*umax
+                elif lag3 == 0 : u = 0
+                else: u = umax
+                state2D = np.array([x1, x3])
+                new_state2D = func_control_prop_2D(state2D, g, u)
+                x1 = new_state2D[0]
+                x3 = new_state2D[1]
+                tim_fin = tim_fin + days_step*24*3600/TU # one day in TU 
+            phase_j = func_phase_j_s1(phase_i, X_f_0, tim_fin, g)
+
+        # if QxQy analysis prioritizes uy over ux
+        if k == 4:
+            phase_j = func_phase_guess(QxQy)
+            tim_fin = 0 # in TU
+            x2 = Xsc[1]
+            x4 = Xsc[3]
+            while m.sqrt((x2 - X_f_0[1])**2) > SOI/1.41 :
+                if tim_fin > max_time_left - time_lapse_s1: break
+                lag4 = m.cos(m.sqrt(-g)*tim_fin + phase_j)
+                if lag4 > 0: u = -1*umax
+                elif lag4 == 0 : u = 0
+                else: u = umax
+                state2D = np.array([x2, x4])
+                new_state2D = func_control_prop_2D(state2D, g, u)
+                x2 = new_state2D[0]
+                x4 = new_state2D[1]
+                tim_fin = tim_fin + days_step*24*3600/TU # one day in TU
+            phase_i = func_phase_i_s1(phase_j, X_f_0, tim_fin, g)
+
+        # With phase_i and phase_j established for Xsc instance, propagate up to delta_r_update
+        delta_r_mag = 0
+        Xsc_0 = Xsc
+        tau_4D = 0
+
+        while delta_r_mag < delta_r_update :
+
+            #if both rx and ry final conditions not yet met
+            if m.sqrt((X_f_0[0]-Xsc[0])**2) > SOI/1.41 and m.sqrt((X_f_0[1]-Xsc[1])**2) > SOI/1.41:
+                Xsc = func_control_prop_4D(Xsc, g, umax, phase_i, phase_j, tau_4D)
+                thrust_count = thrust_count + 2
+
+            #if only rx final condition is not yet met
+            if m.sqrt((X_f_0[0]-Xsc[0])**2) > SOI/1.41 and m.sqrt((X_f_0[1]-Xsc[1])**2) < SOI/1.41:
+                x1 = Xsc[0]
+                x3 = Xsc[2]
+                lag3 = m.cos(m.sqrt(-g) * tau_4D + phase_i)
+                if lag3 > 0: u = -1*umax
+                elif lag3 == 0 : u = 0
+                else: u = umax
+                state2D = np.array([x1, x3])
+                new_state2D = func_control_prop_2D(state2D, g, u)
+                Xsc = np.array([ new_state2D[0], Xsc[1], new_state2D[1], Xsc[3]])
+                thrust_count = thrust_count + 1
+
+            #if only ry final condition is not yet met
+            if m.sqrt((X_f_0[0]-Xsc[0])**2) < SOI/1.41 and m.sqrt((X_f_0[1]-Xsc[1])**2) > SOI/1.41:
+                x2 = Xsc[1]
+                x4 = Xsc[3]
+                lag4 = m.cos(m.sqrt(-g) * tau_4D + phase_j)
+                if lag4 > 0: u = -1*umax
+                elif lag4 == 0 : u = 0
+                else: u = umax
+                state2D = np.array([x2, x4])
+                new_state2D = func_control_prop_2D(state2D, g, u)
+                Xsc = np.array([ Xsc[0], new_state2D[0], Xsc[2], new_state2D[1] ] )
+                thrust_count = thrust_count + 1
+
+            delta_r_mag = func_get_delta_r(Xsc, Xsc_0)
+            tau_4D = tau_4D + days_step*24*3600/TU
+            time_lapse_s1 = time_lapse_s1 + days_step*24*3600/TU
+            if time_lapse_s1 > max_time_left: break
+
+        SOI_dist = func_SOI_dist(X_f_0, Xsc)
+        fuel_used = fuel_used + fuel_consumption_rate * tau_4D
+        if time_lapse_s1 > max_time_left: break
+        
+    # Days_Ballistic = same as argument in function
+    # Distance from Final State = SOI_dist
+    # Fuel Used (Proxy) = Thrust_Count x Engines
+    #data_row = np.array([ days_ballistic, SOI_dist, thrust_count * engines ])
+    data_row = [ days_ballistic, SOI_dist, thrust_count * engines ]
+    
+    return data_row
+    
+    
+    
+# Record the start time
+start_time = time.time()
+
+#generate dataset
+dataset_lowfid = []
+for d in range(5,61,5):
+    for e in np.arange(0.5, 4.1,0.5):
+        dataset_lowfid.append(func_LowFidSolSpace( Missed_Thrust_States[0], fuel_used_array[0], days_ballistic = d, engines = e, mt_date = date(2025, 11, 15), max_date = date(2026, 8, 15) ))
+
+
+# Record the end time
+end_time = time.time()
+
+# Calculate and print the elapsed time
+elapsed_time = end_time - start_time
+print(f"Time taken: {elapsed_time} seconds")
+#print(dataset_lowfid)
+#print(pd.DataFrame(dataset_lowfid,columns=['days_ballist', 'Dist from Xf', 'Fuel Use Proxy']))
+
+dataset_lowfid = np.array(dataset_lowfid)
+# Extract the required columns
+x = dataset_lowfid[:, 0]
+y = dataset_lowfid[:, 1]
+z = dataset_lowfid[:, 2]
+
+# Create a meshgrid for x and y values
+X, Y = np.meshgrid(np.arange(min(x), max(x)+1, 1), np.arange(min(y), max(y)+0.001, 0.001))
+
+# Interpolate the z values on the meshgrid
+Z = griddata((x, y), z, (X, Y), method='linear')
+
+# Create a contour plot
+plt.figure(figsize=(10, 6))
+contour = plt.contourf(X, Y, Z, cmap='plasma')
+plt.colorbar(contour, label = 'Fuel Use Proxy')
+
+# Set the y-axis limits
+plt.ylim(min(y)-0.01, max(y)+0.01)
+
+# Add labels and title
+plt.xlabel('Days Ballistic Before Thrust Recovery')
+plt.ylabel('Distance (AU) from Fixed Final State')
+plt.title('Solution Space for Free Final Time Optimized Trajectory after \nMissed Thrust Event on Nov 15, 2025 \n')
+
+# Show the plot
+plt.show()
