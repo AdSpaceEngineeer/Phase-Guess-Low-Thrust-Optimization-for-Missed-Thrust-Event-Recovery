@@ -1,0 +1,63 @@
+# PSYCHE -255 EPHEMERAL DATA FROM JPL NAIF
+# links for Pscyhe 255 spacecraft
+# Created by Monte 171.1 on 2025/04/24 14:56 UTC, psyche.mdnav@jpl.nasa.gov
+# https://naif.jpl.nasa.gov/pub/naif/PSYCHE/kernels/spk/psyche_ref_250520-290626_250424_v1.bsp.lbl
+# dataset interval 2025 MAY 20 00:16:09.185  to 2029 JUN 26 14:29:49.496
+
+#convert Psyche (-255) ephemeral data to pandas dataframe
+!pip install spiceypy pandas
+import spiceypy as spice
+import pandas as pd
+import numpy as np
+# Define the file paths for the kernels
+kernel_path = "psyche_ref_250520-290626_250424_v1.bsp"  # Update with your actual BSP file path
+lsk_path = "naif0012.tls"  # Leap Seconds Kernel
+# Load the required SPICE kernels
+spice.furnsh(kernel_path)
+spice.furnsh(lsk_path)
+# Define parameters
+target = "-255"                # Target from .bsp.lbl (PSYC)
+observer = "SUN"               # Reference body
+frame = "ECLIPJ2000"           # Coordinate frame
+correction = "NONE"            # No corrections
+# Get the kernel's coverage for the target
+target_id = int(target)
+coverage = spice.spkcov(kernel_path, target_id)
+# Assume one continuous interval is present:
+et_cov_start = coverage[0]
+et_cov_end = coverage[1]
+# For safety, subtract a small buffer (e.g., 10 seconds) from the end time
+buffer = 10.0  # seconds
+et_end = et_cov_end - buffer
+# Use the kernel's start time directly as our start time
+et_start = et_cov_start
+# Print the coverage for verification
+print("Kernel Coverage:")
+print("Start UTC:", spice.et2utc(et_start, "C", 0))
+print("End UTC  :", spice.et2utc(et_cov_end, "C", 0))
+print("Sampling End UTC (buffered):", spice.et2utc(et_end, "C", 0))
+# Define number of sample points
+num_points = 50
+# Generate time steps between the start and buffered end times
+et_times = np.linspace(et_start, et_end, num_points)
+# Collect state vectors for each time step
+data = []
+for et in et_times:
+    state_vector, _ = spice.spkezr(target, et, frame, correction, observer)
+    data.append([et] + list(state_vector))
+# Create a Pandas DataFrame
+columns = ["ET", "X (km)", "Y (km)", "Z (km)", "VX (km/s)", "VY (km/s)", "VZ (km/s)"]
+df = pd.DataFrame(data, columns=columns)
+# Convert ET to human-readable UTC time and add as a new column
+df["UTC Time"] = df["ET"].apply(spice.et2utc, args=("C", 0))
+# Unload the kernels after use
+spice.unload(kernel_path)
+spice.reset()  # This clears all loaded kernels
+# Display the first few rows of the DataFrame
+print(df.head())
+# Display first few rows of states and time
+print(df[["X (km)", "Y (km)", "Z (km)", "VX (km/s)", "VY (km/s)", "VZ (km/s)", "UTC Time"]])
+# Extract rows 5 to 10 (remember: Python is 0-indexed, so 5:11)
+df_subset = df.iloc[5:11]
+# Save to Excel
+df_subset.to_excel("Psyche255_ephemerals.xlsx", index=False)
