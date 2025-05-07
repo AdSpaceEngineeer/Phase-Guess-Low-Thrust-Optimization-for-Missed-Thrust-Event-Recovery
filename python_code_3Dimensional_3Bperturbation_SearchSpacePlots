@@ -1,0 +1,279 @@
+import math as m
+import numpy as np
+from scipy.integrate import solve_ivp
+from scipy.optimize import fsolve
+from datetime import date, timedelta
+import matplotlib.pyplot as plt
+
+# --- Hyperparameters & Fuel ---
+AU = 1.5e8
+Sun_grav_param = 1.327e11
+TU = m.sqrt(AU**3/Sun_grav_param)
+muS = 1
+muM_km = 4.28e4
+muM = muM_km * (TU**2)/(AU**3)
+days_step = 1
+SOI = 0.038/5
+fuel_consumption_rate = 0.350    # per engine per day
+# CHANGE fuel_consumption_rate = 1.0
+total_mass = 2747
+theta_tol = 18.19 * m.pi/180
+
+def func_get_r(X):
+    return m.sqrt(X[0]**2 + X[1]**2 + X[2]**2)
+
+def func_get_g_3Bpert(r_mag, Xsc, Xm, mu3B):
+    g2 = -muS/(r_mag**3)
+    rSC, rM = Xsc[:3], Xm[:3]
+    cos_theta = np.dot(rSC, rM)/(np.linalg.norm(rSC)*np.linalg.norm(rM))
+    theta = m.acos(max(min(cos_theta,1),-1))
+    if abs(theta)>theta_tol:
+        p = 0.0
+    else:
+        f = np.linalg.norm(rSC - rM)**3
+        l = np.linalg.norm(rSC)**3
+        h = (f - l)/(f*l)
+        alpha = np.dot(rSC, rM)/(np.linalg.norm(rSC)**2)
+        p = -mu3B*(1/f + h*alpha)
+    return g2 + p
+
+def func_integrator_2BP(t, state, g):
+    rx, ry, rz, vx, vy, vz = state
+    return [vx, vy, vz, g*rx, g*ry, g*rz]
+
+def func_2BP_prop(state, days, mu):
+    X = state.copy()
+    dt = days_step*24*3600/TU
+    for _ in range(int(days)):
+        r = func_get_r(X)
+        g = -mu/(r**3)
+        sol = solve_ivp(func_integrator_2BP, [0,dt], X, args=(g,), t_eval=[dt])
+        X = sol.y[:,0]
+    return X
+
+def func_2BP_prop_3Bpert(X0, days, Xm, mu3B):
+    X = X0.copy()
+    dt = days_step*24*3600/TU
+    for _ in range(int(days)):
+        r_mag = func_get_r(X)
+        g = func_get_g_3Bpert(r_mag, X, Xm, mu3B)
+        sol = solve_ivp(func_integrator_2BP, [0,dt], X, args=(g,), t_eval=[dt])
+        X = sol.y[:,0]
+    return X
+
+def func_get_umax(r_mag, fuel_used, time_in_days, engines):
+    irrad = 63e6*(0.00464/r_mag)**2
+    power = 0.20*irrad*75*engines
+    thrust = power/83000
+    # CHANGE mass = total_mass - fuel_used - time_in_days
+    mass = total_mass - fuel_used - fuel_consumption_rate * engines * time_in_days
+    return (thrust/mass)*(1/1000)*(TU**2/AU)
+
+def func_control_prop_6D_full(X0, Xf, mu3B, umax, phases, dtau):
+    phi_x, phi_y, phi_z = phases
+    r_mag = func_get_r(X0)
+    g = func_get_g_3Bpert(r_mag, X0, Xf, mu3B)
+    p = m.sqrt(-g)
+    lagx = m.cos(p*dtau + phi_x)
+    lagy = m.cos(p*dtau + phi_y)
+    lagz = m.cos(p*dtau + phi_z)
+    ux = -umax if lagx>0 else (0 if lagx==0 else umax)
+    uy = -umax if lagy>0 else (0 if lagy==0 else umax)
+    uz = -umax if lagz>0 else (0 if lagz==0 else umax)
+    sol = solve_ivp(
+        lambda t,s: [s[3],s[4],s[5], g*s[0]+ux, g*s[1]+uy, g*s[2]],
+        [0,dtau], X0, t_eval=[dtau]
+    )
+    return sol.y[:,0]
+
+def phase_residuals(phases, X0, Xf, mu3B, umax, dtau, X_target):
+    X1 = func_control_prop_6D_full(X0, X_target, mu3B, umax, phases, dtau)
+    return X1[:3] - X_target[:3]
+
+# --- Low-Fidelity Solver: distance measured to Xf ---
+def func_LowFidSolSpace_3d_3BP_mass(
+    Xmt, Xmars_mt, Xf, fuel0, days_ballistic, engines, mt_date, max_date
+):
+    Xsc = func_2BP_prop_3Bpert(Xmt, days_ballistic, Xmars_mt, muM)
+    Xm = func_2BP_prop(Xmars_mt, days_ballistic, muS)
+    elapsed = days_ballistic
+    fuel_used = fuel0
+    thrust_days = 0
+    dtau = days_step*24*3600/TU
+    dist = func_get_r(Xsc - Xf)
+    SOI_entry_date = None
+
+    while dist > SOI and elapsed < (max_date - mt_date).days:
+        umax = func_get_umax(func_get_r(Xsc), fuel_used, elapsed, engines)
+        phases = fsolve(
+            phase_residuals, [0,0,0],
+            args=(Xsc, Xf, muM, umax, dtau, Xf), maxfev=50
+        )
+        Xsc = func_control_prop_6D_full(Xsc, Xf, muM, umax, phases, dtau)
+        Xm = func_2BP_prop(Xm, days_step, muS)
+        elapsed += days_step
+        thrust_days += days_step
+        # CHANGE fuel_used += fuel_consumption_rate*days_step
+        fuel_used += fuel_consumption_rate * engines * days_step
+        dist = func_get_r(Xsc - Xf)
+        if dist <= SOI and SOI_entry_date is None:
+            SOI_entry_date = mt_date + timedelta(days=elapsed)
+
+    remaining_days = (max_date - mt_date).days - elapsed
+    starting_mass = total_mass - fuel0
+    ending_mass = starting_mass - thrust_days*fuel_consumption_rate * engines
+    return dist, starting_mass, ending_mass, SOI_entry_date, remaining_days
+
+# --- Test with provided data ---
+mt_launch_date = date(2023,10,13)
+mt_date = date(2025,12,20)
+max_date = date(2026,7,31)
+days_ballistic = 15
+engines = 1
+fuel_used_0 = fuel_consumption_rate*(mt_date-mt_launch_date).days
+
+sc_km = np.array([182012492.3, -165717281.8, -7032063.17])
+sc_kms = np.array([11.55318845, 22.33810677, 0.094463258])
+Xmt = np.hstack((sc_km/AU, sc_kms*(TU/AU)))
+
+mars_km = np.array([138575711.9, -155694337, -6634758.677])
+mars_kms = np.array([18.96484699, 18.26155171, -0.082311565])
+Xmars_mt = np.hstack((mars_km/AU, mars_kms*(TU/AU)))
+
+Xf_km = np.array([204180870.9, 43655878.42, -4869988.642])
+Xf_kms = np.array([-7.300757, 28.094103, -1.115205])
+Xf = np.hstack((Xf_km/AU, Xf_kms*(TU/AU)))
+
+initial_dist = func_get_r(Xmt - Xf)
+final_dist, m_start, m_end, soi_date, remaining_days = func_LowFidSolSpace_3d_3BP_mass(
+    Xmt, Xmars_mt, Xf, fuel_used_0,
+    days_ballistic=days_ballistic, engines=engines,
+    mt_date=mt_date, max_date=max_date
+)
+
+print(f"Initial distance:              {initial_dist:.6f} AU")
+print(f"Days without thrust:           {days_ballistic:.2f} days")
+print(f"Final distance from Mars:      {final_dist:.6f} AU, compared to Mars SOI 0.38 AU")
+print(f"Mass at Missed Thrust Event:   {m_start:.2f} kg")
+print(f"Mass at Rendezvous:            {m_end:.2f} kg")
+if soi_date:
+    print(f"SOI entry date:            {soi_date.isoformat()}")
+else:
+    print("SOI entry not achieved within max date")
+print(f"Days remaining:                {remaining_days} days")
+
+# plot of trajectories
+# build SC and Mars trajectories
+sc_positions, mars_positions = [], []
+state_sc = Xmt.copy()
+state_mars = Xmars_mt.copy()
+# ballistic segment
+for _ in range(days_ballistic):
+    sc_positions.append(state_sc[:3])
+    mars_positions.append(state_mars[:3])
+    state_sc = func_2BP_prop_3Bpert(state_sc, 1, state_mars, muM)
+    state_mars = func_2BP_prop(state_mars, 1, muS)
+# thrust segment until SOI entry
+if soi_date:
+    days_to_soi = (soi_date - mt_date).days
+else:
+    days_to_soi = (max_date - mt_date).days
+# reset state_sc and state_mars to post-ballistic
+state_sc = func_2BP_prop_3Bpert(Xmt, days_ballistic, Xmars_mt, muM)
+state_mars = func_2BP_prop(Xmars_mt, days_ballistic, muS)
+elapsed_thrust = 0
+while elapsed_thrust < (days_to_soi - days_ballistic):
+    sc_positions.append(state_sc[:3])
+    mars_positions.append(state_mars[:3])
+    # compute thrust step
+    umax = func_get_umax(func_get_r(state_sc), fuel_used_0 + elapsed_thrust, elapsed_thrust, engines)
+    phases = fsolve(phase_residuals, [0,0,0], args=(state_sc, Xf, muM, umax, days_step*24*3600/TU, Xf), maxfev=50)
+    state_sc = func_control_prop_6D_full(state_sc, Xf, muM, umax, phases, days_step*24*3600/TU)
+    state_mars = func_2BP_prop(state_mars, 1, muS)
+    elapsed_thrust += 1
+# convert to array
+sc_positions = np.array(sc_positions)
+mars_positions = np.array(mars_positions)
+
+# --- Plotting ---
+fig = plt.figure(figsize=(8,6))
+ax = fig.add_subplot(111, projection='3d')
+ax.view_init(elev=80, azim=-180)
+# ballistic
+ax.plot(sc_positions[:days_ballistic,0], sc_positions[:days_ballistic,1], sc_positions[:days_ballistic,2],
+        '--', color='blue', label='SC Ballistic')
+# thrust
+ax.plot(sc_positions[days_ballistic:,0], sc_positions[days_ballistic:,1], sc_positions[days_ballistic:,2],
+        '-', color='cyan', label='SC Thrusting')
+# Mars
+ax.plot(mars_positions[:,0], mars_positions[:,1], mars_positions[:,2], color='red', label='Mars')
+# markers
+ax.scatter(Xmt[0], Xmt[1], Xmt[2], marker='x', color='black', s=50, label='Missed Thrust Event')
+ax.scatter(Xmars_mt[0], Xmars_mt[1], Xmars_mt[2], marker='o', color='red', s=100, label='Mars')
+#if soi_date:
+ #   idx = days_to_soi
+  #  ax.scatter(sc_positions[idx,0], sc_positions[idx,1], sc_positions[idx,2], marker='o', color='magenta', s=50, label='SOI Entry')
+
+# Equal scales & grid
+ax.set_box_aspect([1,1,1])
+all_x = np.concatenate((sc_positions[:,0], mars_positions[:,0]))
+all_y = np.concatenate((sc_positions[:,1], mars_positions[:,1]))
+all_z = np.concatenate((sc_positions[:,2], mars_positions[:,2]))
+x_min, x_max = np.floor(all_x.min()*2)/2, np.ceil(all_x.max()*2)/2
+y_min, y_max = np.floor(all_y.min()*2)/2, np.ceil(all_y.max()*2)/2
+z_min, z_max = np.floor(all_z.min()*2)/2, np.ceil(all_z.max()*2)/2
+ax.set_xlim(x_min-0.2, x_max+0.5)
+ax.set_ylim(y_min-0.5, y_max+0.5)
+ax.set_zlim(z_min, z_max)
+ax.set_xticks(np.arange(x_min, x_max+0.001, 0.5))
+ax.set_yticks(np.arange(y_min, y_max+0.001, 0.5))
+ax.set_zticks(np.arange(z_min, z_max+0.001, 0.5))
+
+ax.set_xlabel('X (AU)', fontsize=12, fontweight='bold')
+ax.set_ylabel('Y (AU)', fontsize=12, fontweight='bold')
+ax.set_zlabel('Z (AU)', fontsize=10)
+
+ax.legend()
+plt.tight_layout()
+plt.show()
+
+
+# Contour plot of days ballistic vs final distance vs fuel used for engines 1–4
+from scipy.interpolate import griddata
+
+ballistic_range = np.arange(5, 61, 5)
+engines_range = np.arange(1, 5)
+
+days_list = []
+dist_list = []
+fuel_list = []
+for eng in engines_range:
+    for days_b in ballistic_range:
+        final_dist, m_start, m_end, soi_date, remaining_days = func_LowFidSolSpace_3d_3BP_mass(
+            Xmt, Xmars_mt, Xf, fuel_used_0,
+            days_ballistic=int(days_b), engines=int(eng),
+            mt_date=mt_date, max_date=max_date
+        )
+        fuel_used = m_start - m_end
+        # only include if rendezvous achieved
+        if final_dist <= SOI:
+            days_list.append(days_b)
+            dist_list.append(final_dist)
+            fuel_list.append(fuel_used)
+
+# create interpolation grid
+xi = np.linspace(min(days_list), max(days_list), 100)
+yi = np.linspace(min(dist_list), max(dist_list), 100)
+Xg, Yg = np.meshgrid(xi, yi)
+Zg = griddata((days_list, dist_list), fuel_list, (Xg, Yg), method='linear', fill_value=np.nan)
+
+# plot single contour
+plt.figure(figsize=(10,6))
+pc = plt.contourf(Xg, Yg, Zg, levels=20, cmap='plasma')
+cbar = plt.colorbar(pc)
+cbar.set_label('Fuel Used (kg)', fontsize=11)
+plt.xlabel('Ballistic Days', fontsize=12)
+plt.ylabel('Final Distance (AU)', fontsize=12)
+plt.title('Fuel Required vs Ballistic Days and Final Distance (Engines 1–4)', fontsize=13)
+plt.grid(True)
+plt.show()
